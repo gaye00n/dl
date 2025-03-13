@@ -1,0 +1,156 @@
+!pip install -U accelerate==0.29.3 peft==0.10.0 bitsandbytes==0.43.1 transformers==4.40.0 trl==0.8.6 datasets==2.19.0import torch
+from datasets import Dataset, load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline, TrainingArguments
+from peft import LoraConfig, PeftModel
+from trl import SFTTrainer
+import os
+
+from huggingface_hub import login
+login()
+!gdown 1_R-szeLaxXw49kLaGQ3gFi16Gy-_rkZb
+# 필요한 라이브러리 설치
+# pip install pandas openpyxl
+
+import pandas as pd
+import json
+
+# 엑셀 파일 읽기
+excel_data = pd.read_excel('/content/qa종합_최종_modified.xlsx')
+
+# JSON으로 변환
+json_data = excel_data.to_json(orient='records', force_ascii=False, indent=4)
+
+# 파일로 저장
+with open('결과.json', 'w', encoding='utf-8') as f:
+    f.write(json_data)
+
+
+BASE_MODEL = "beomi/gemma-ko-2b"
+
+model = AutoModelForCausalLM.from_pretrained(BASE_MODEL, device_map={"":0})
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, add_special_tokens=True)
+
+# 보드게임QA dataset형식으로 변환
+
+from datasets import Dataset
+with open('결과.json', 'r', encoding='utf-8') as f:
+    data = json.load(f)
+
+# pandas DataFrame-> dictionary 리스트
+data_dict = {
+    'question': [item['질문'] for item in data],
+    'answer': [item['답변'] for item in data]
+}
+
+# dict -> Dataset 형식으로 변환
+dataset = Dataset.from_dict(data_dict)
+
+def preprocess(data):
+    return data.map(
+        lambda x: {
+            'data': tokenizer.apply_chat_template(
+                [
+                    {"role": "system", "content": x['question']},
+                    {"role": "assistant", "content": x['answer']}
+                ],
+                add_generation_prompt=False,
+                tokenize=False,
+                return_tensors="pt"
+            )
+        }
+    ).map(
+        lambda samples: tokenizer(samples["data"]),
+        batched=True
+    )
+
+# 전처리 적용
+processed_data = preprocess(dataset)
+
+
+def generate_prompt(example):
+    output_texts = []
+    for i in range(len(example['question'])):
+        prompt = f"### Instruction: {example['question'][i]}\n\n### Response: {example['answer'][i]}<eos>"
+        output_texts.append(prompt)
+    return output_texts
+
+
+lora_config = LoraConfig(
+    r=6,
+    lora_alpha = 8,
+    lora_dropout = 0.05,
+    target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
+    task_type="CAUSAL_LM",
+    use_dora = True
+)
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16
+)
+
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=dataset,
+    max_seq_length=512,
+    args=TrainingArguments(
+        output_dir="outputs",
+        # num_train_epochs = 0.7,
+        max_steps=3000,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=8,
+        optim="paged_adamw_8bit",
+        warmup_steps=500,
+        learning_rate=2e-4,
+        bf16=True,
+        logging_steps=100,
+        save_steps=500,
+        push_to_hub=False,
+        report_to='none',
+    ),
+    peft_config=lora_config,
+    formatting_func=generate_prompt,
+)
+trainer.train()
+
+# 학습2, DoRA 사용
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=dataset,
+    max_seq_length=512,
+    args=TrainingArguments(
+        output_dir="outputs",
+        # num_train_epochs = 0.7,
+        max_steps=1000,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=8,
+        optim="paged_adamw_8bit",
+        warmup_steps=500,
+        learning_rate=2e-4,
+        bf16=True,
+        logging_steps=100,
+        save_steps=500,
+        push_to_hub=False,
+        report_to='none',
+    ),
+    peft_config=lora_config,
+    formatting_func=generate_prompt,
+)
+trainer.train()
+
+
+pipe_finetuned = pipeline("text-generation", model=model, tokenizer=tokenizer, max_new_tokens=512)
+prompt = "뱅이라는 보드게임에서 보안관이 맥주카드를 사용할 수 있나요?"
+formatted_prompt = f"### Response: {prompt}\n\n### Response:"
+
+outputs = pipe_finetuned(
+    formatted_prompt,
+    do_sample=True,
+    temperature=0.2,
+    top_k=50,
+    top_p=0.95,
+    repetition_penalty=1.2,
+    add_special_tokens=True
+)
+print(outputs[0]["generated_text"][len(formatted_prompt):])
