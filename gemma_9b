@@ -1,0 +1,197 @@
+!pip install -q unsloth
+!pip install -q --force-reinstall --no-deps git+https://github.com/unslothai/unsloth.git
+
+!pip install --upgrade torch
+!pip install --upgrade transformers
+
+# 모델 로드
+from unsloth import FastLanguageModel
+
+# 모델 설정값 정의
+max_seq_length = 2048
+dtype = None
+load_in_4bit = True
+
+# 모델과 토크나이저 로드
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name="UNIVA-gemma9b/gemma9bko-2b",
+    max_seq_length=max_seq_length,
+    dtype=dtype,
+    load_in_4bit=load_in_4bit,
+    token=None
+)
+
+print("설정이 완료되었습니다!")
+
+
+# 프롬프트 설정
+prompt_style = """아래는 작업을 설명하는 지시사항과 추가 맥락을 제공하는 입력이 쌍으로 구성되어 있습니다.
+요청을 적절히 완료하는 응답을 작성하세요.
+답변하기 전에 질문을 신중히 생각하고 논리적이고 정확한 응답을 보장하기 위한 단계별 사고 과정을 만드세요.
+
+### Instruction:
+당신은 게임 분석, 전략적 사고, 최적 플레이 기법에 대한 고급 지식을 갖춘 보드게임 전문가입니다. 다음 보드게임 질문에 정확하고 친절하게 답변해 주세요.
+
+### Question:
+{}
+
+### Response:
+<think>{}"""
+
+
+# 보드게임 기본지식 확인
+question = "보드게임 뱅!의 규칙은 어떤게 있나요?"
+
+
+FastLanguageModel.for_inference(model)
+inputs = tokenizer([prompt_style.format(question, "")], return_tensors="pt").to("cuda")
+
+outputs = model.generate(
+    input_ids=inputs.input_ids,
+    attention_mask=inputs.attention_mask,
+    max_new_tokens=1200,
+    use_cache=True,
+)
+response = tokenizer.batch_decode(outputs)
+print(response[0].split("### Response:")[1])
+
+EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
+
+def formatting_prompts_func(examples):
+    inputs = examples["instruction"]
+    outputs = examples["output"]
+    texts = []
+    for input, output in zip(inputs, outputs):
+        text = train_prompt_style.format(input, output) + EOS_TOKEN
+        texts.append(text)
+    return {
+        "text": texts,
+    }
+
+from datasets import load_dataset
+dataset = load_dataset("/content/qa_modified.xlsx", split = "train", trust_remote_code=True) # 데이터셋
+dataset = dataset.map(formatting_prompts_func, batched = True,)
+dataset["text"][0]
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16,
+    target_modules=[
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ],
+    lora_alpha=16,
+    lora_dropout=0,
+    bias="none",
+    use_gradient_checkpointing="unsloth",  # True or "unsloth" for very long context
+    random_state=3407,
+    use_rslora=False,
+    loftq_config=None,
+)
+
+import torch
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"GPU Name: {torch.cuda.get_device_name(0)}")
+print(f"Is bfloat16 supported? {torch.cuda.is_bf16_supported()}")
+
+for name, param in model.named_parameters():
+    print(f"{name}: {param.dtype}")
+
+if hasattr(model, "embed_tokens"):
+    model.embed_tokens = model.embed_tokens.to(torch.bfloat16)
+torch.backends.cuda.matmul.allow_tf32 = False
+os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6+PTX"
+
+import torch
+import transformers
+print(torch.__version__)  # ex) 2.1.0
+print(transformers.__version__)  # ex) 4.36.0
+
+import os
+import wandb
+import torch
+from transformers import Trainer, TrainingArguments
+from torch.utils.data import Dataset
+
+# wandb 비활성화
+os.environ["WANDB_DISABLED"] = "true"
+wandb.init(mode="disabled")
+os.environ["USE_CUTLASS"] = "False"
+
+class CustomDataset(Dataset):
+    def __init__(self, dataset, tokenizer, max_length):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        text = item['text']
+
+        # 토크나이징
+        encodings = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=self.max_length,
+            padding='max_length',
+            return_tensors='pt'
+        )
+
+        # labels 추가 (input_ids와 동일하게 설정)
+        return {
+            'input_ids': encodings['input_ids'].squeeze(),
+            'attention_mask': encodings['attention_mask'].squeeze(),
+            'labels': encodings['input_ids'].squeeze()  # labels 추가
+        }
+
+processed_dataset = CustomDataset(dataset, tokenizer, max_seq_length)
+model = model.to(torch.bfloat16)
+from torch.optim import AdamW
+from accelerate import Accelerator
+
+# 옵티마이저 정의
+optimizer = AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
+
+# Accelerator 설정
+accelerator = Accelerator(mixed_precision="bf16")
+
+# 모델, 옵티마이저, 데이터셋을 accelerator에 적용
+model, optimizer, processed_dataset = accelerator.prepare(model, optimizer, processed_dataset)
+
+
+training_args = TrainingArguments(
+    output_dir="outputs",
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=4,
+    warmup_steps=5,
+    max_steps=60,
+    learning_rate=2e-4,
+    fp16=False,  # ❌ fp16 비활성화
+    bf16=True,   # ✅ bf16 사용
+    logging_steps=10,
+    optim="adamw_torch",
+    weight_decay=0.01,
+    lr_scheduler_type="linear",
+    report_to="none",
+    remove_unused_columns=False,
+    fp16_full_eval=False,  # ✅ 추가
+    bf16_full_eval=True
+)
+
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=processed_dataset,
+)
+
+trainer.train()
